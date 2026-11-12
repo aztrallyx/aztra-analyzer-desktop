@@ -1,0 +1,126 @@
+name: Build Windows
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Descomprimir proyecto
+        shell: pwsh
+        run: Expand-Archive -Path aztra_analyzer_desktop.zip -DestinationPath . -Force
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Crear proyecto Windows
+        shell: bash
+        working-directory: aztra_analyzer_desktop
+        run: |
+          cp -r lib ../_lib_backup
+          cp pubspec.yaml ../_pubspec_backup.yaml
+          flutter create . --platforms=windows --project-name aztra_analyzer --org com.aztrallyx
+          rm -rf lib test
+          cp -r ../_lib_backup lib
+          cp ../_pubspec_backup.yaml pubspec.yaml
+          # Titulo de la ventana nativa
+          sed -i 's/L"aztra_analyzer"/L"Aztra Analyzer"/' windows/runner/main.cpp || true
+
+      - name: Descargar FFmpeg (LGPL, sin GPL)
+        shell: pwsh
+        working-directory: aztra_analyzer_desktop
+        run: |
+          $base = 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest'
+          $names = @(
+            'ffmpeg-n8.0-latest-win64-lgpl-8.0.zip',
+            'ffmpeg-n7.1-latest-win64-lgpl-7.1.zip',
+            'ffmpeg-master-latest-win64-lgpl.zip'
+          )
+          $ok = $false
+          foreach ($n in $names) {
+            try {
+              Invoke-WebRequest -Uri "$base/$n" -OutFile ffmpeg.zip -UseBasicParsing
+              Write-Host "Descargado: $n"
+              $ok = $true
+              break
+            } catch {
+              Write-Host "No se pudo con ${n}: $($_.Exception.Message)"
+            }
+          }
+          if (-not $ok) { throw 'No pude descargar FFmpeg' }
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp -Force
+          $bin = Get-ChildItem ffmpeg_tmp -Recurse -Directory -Filter bin | Select-Object -First 1
+          New-Item -ItemType Directory -Force ffmpeg_bin | Out-Null
+          Copy-Item "$($bin.FullName)\ffmpeg.exe" ffmpeg_bin\
+          Copy-Item "$($bin.FullName)\ffprobe.exe" ffmpeg_bin\
+          $lic = Get-ChildItem ffmpeg_tmp -Recurse -Filter 'LICENSE*' | Select-Object -First 1
+          if ($lic) { Copy-Item $lic.FullName ffmpeg_bin\FFMPEG-LICENSE.txt }
+
+      - name: Probar FFmpeg (filtros y analisis de prueba)
+        shell: pwsh
+        working-directory: aztra_analyzer_desktop
+        run: |
+          $ff = (Resolve-Path .\ffmpeg_bin\ffmpeg.exe).Path
+          $fp = (Resolve-Path .\ffmpeg_bin\ffprobe.exe).Path
+          $filters = & $ff -hide_banner -filters 2>&1 | Out-String
+          foreach ($f in 'astats','ebur128','aselect','ametadata','showspectrumpic','aformat','pan','asplit','asetpts','format') {
+            if ($filters -notmatch "\s$f\s") { throw "A este FFmpeg le falta el filtro: $f" }
+          }
+          & $ff -hide_banner -y -f lavfi -i "sine=frequency=440:duration=3" -ar 44100 prueba.wav
+          if ($LASTEXITCODE -ne 0) { throw 'No pude generar el audio de prueba' }
+          & $fp -v error -print_format json -show_format -show_streams -i prueba.wav | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'ffprobe fallo en el audio de prueba' }
+          # Misma cadena de niveles que usa la app (ruta relativa, como en la app)
+          & $ff -hide_banner -nostats -nostdin -i prueba.wav -map 0:a:0 -vn -sn -dn `
+            -af "astats=metadata=1:reset=0:measure_perchannel=Peak_level+RMS_level+Peak_count:measure_overall=Peak_level+RMS_level,ebur128=peak=true:metadata=1:framelog=quiet,aselect='gte(t,0.000)',ametadata=print:file='m.txt'" `
+            -f null -
+          if ($LASTEXITCODE -ne 0) { throw 'La cadena de niveles fallo' }
+          if (-not (Select-String -Path m.txt -Pattern 'lavfi.r128.I' -Quiet)) { throw 'No salio LUFS en la prueba' }
+          Remove-Item prueba.wav, m.txt -ErrorAction SilentlyContinue
+          Write-Host 'FFmpeg OK'
+
+      - name: Compilar
+        shell: bash
+        working-directory: aztra_analyzer_desktop
+        run: |
+          flutter pub get
+          dart run flutter_launcher_icons
+          flutter build windows --release
+
+      - name: Agregar FFmpeg y librerias de Visual C++ a la app
+        shell: pwsh
+        working-directory: aztra_analyzer_desktop
+        run: |
+          $rel = 'build\windows\x64\runner\Release'
+          New-Item -ItemType Directory -Force "$rel\bin" | Out-Null
+          Copy-Item ffmpeg_bin\* "$rel\bin\"
+          # Librerias de Visual C++ junto al .exe: asi funciona aunque la
+          # laptop no las tenga instaladas.
+          foreach ($d in 'msvcp140.dll','vcruntime140.dll','vcruntime140_1.dll','msvcp140_1.dll','msvcp140_2.dll','concrt140.dll') {
+            $src = Join-Path $env:SystemRoot "System32\$d"
+            if (Test-Path $src) { Copy-Item $src $rel -Force }
+          }
+          Copy-Item LICENSE, COPYING, NOTICE $rel -ErrorAction SilentlyContinue
+          Get-ChildItem $rel | Select-Object Name, Length
+
+      - name: Instalador
+        shell: pwsh
+        working-directory: aztra_analyzer_desktop
+        run: |
+          choco install innosetup -y --no-progress
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          & $iscc "/DAppVersion=2.3.${{ github.run_number }}" installer\aztra_analyzer.iss
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup fallo' }
+          Get-ChildItem dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: desktop-${{ github.run_number }}
+          name: Aztra Analyzer (Windows) ${{ github.run_number }}
+          files: aztra_analyzer_desktop/dist/*.exe
